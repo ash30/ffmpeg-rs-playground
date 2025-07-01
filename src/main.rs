@@ -1,83 +1,62 @@
 use anyhow::{Result, anyhow};
+use clap::Parser;
 use ctrlc;
 use ffmpeg_next::{
     Dictionary, Error, Rational, codec::Context, device, encoder, ffi::EAGAIN, format, frame,
-    packet, software::scaling,
+    packet,
 };
-use std::{sync::mpsc::channel, time};
+use std::path::PathBuf;
+use std::sync::mpsc::{TryRecvError, channel};
+
+// get list of devices via `ffmpeg -f avfoundation -list_devices true -i ""`
+
+#[derive(Parser)]
+struct Cli {
+    #[arg(short, long)]
+    device: String,
+
+    #[arg(short, long, value_name = "FILE")]
+    output_path: PathBuf,
+}
 
 fn main() -> Result<()> {
-    // Find local devices that match
+    let args = Cli::parse();
+
     let input = device::input::video()
         .find(|d| d.name() == "avfoundation")
         .ok_or(anyhow!("device not found"))?;
 
-    // these settings are for the avfoundation device
+    let framerate = Rational::new(30, 1);
+
     let mut opts = Dictionary::new();
     opts.set("pixel_format", "uyvy422");
-    //opts.set("capture_raw_data", "1");
-    //opts.set("video_size", "2560x1440");
-
-    // Regardless of setting this, we always get 100k/1 fps
     opts.set("frame_rate", "30/1");
 
     // devices share same interface as codec, so we call format::open
     // the path is 'overloaded' to represent local device number
-    let mut device = format::open_with("2", &input, opts).unwrap().input();
-
-    // we're opening a 'format' which maps to an 'input' which wraps a context
-    //
-    // Timebase and rate are set for stream
-    dbg!(device.stream(0).unwrap().time_base());
-    dbg!(device.stream(0).unwrap().rate());
-    let original_fps = Rational::new(30, 1);
-    let original_timebase = Rational::new(1, 1_000_000);
+    let mut device = format::open_with(&args.device, &input, opts)
+        .unwrap()
+        .input();
+    let in_stream_timebase = device.stream(0).unwrap().time_base();
 
     // Here we are creating the decoder and its context
     let mut dec_ctx = Context::from_parameters(device.stream(0).unwrap().parameters())?;
 
-    // REF: https://lists.ffmpeg.org/pipermail/ffmpeg-devel/2023-March/307182.html
-    // timebase is deprecated for decoder
-    // but supposeduly framerate or pkt_timebase should be define, it is not here
-    dbg!(dec_ctx.time_base());
-    dbg!(dec_ctx.frame_rate());
-    unsafe {
-        dbg!((*dec_ctx.as_ptr()).pkt_timebase);
-    }
-
-    dbg!(original_fps);
-    dec_ctx.set_time_base(original_fps.invert());
+    dec_ctx.set_time_base(framerate.invert());
     let mut decoder = dec_ctx.decoder().video()?;
-
-    // The opened decoder still have invalid frame and timebase
-    dbg!(decoder.frame_rate());
-    dbg!(decoder.time_base());
-
-    //decoder.set_time_base(original_fps.invert());
 
     let codec =
         encoder::find_by_name("h264_videotoolbox").ok_or_else(|| anyhow!("Missing encoder"))?;
-    //let codec = encoder::find(Id::H264).ok_or_else(|| anyhow!("Missing encoder"))?;
     let enc_ctx = Context::new_with_codec(codec);
-
-    // The encoder here is a wrapper around encoding ctx
-    // and provides methods more specifically for encoding
-    // Video specialises further
-    //
-    // ctx -> encoder -> video -> encoder(video)
-    // the last encoder(video) is what you get when you OPEN the context
-    // slightly confusing...
-    //
 
     let mut encoder = enc_ctx.encoder().video()?;
 
-    let frame_rate = original_fps;
-    // we can set params here OR via open_with
+    let frame_rate = framerate;
     encoder.set_width(decoder.width());
     encoder.set_height(decoder.height());
     encoder.set_aspect_ratio(decoder.aspect_ratio());
     encoder.set_frame_rate(Some(frame_rate));
-    encoder.set_time_base(original_timebase);
+    encoder.set_time_base(in_stream_timebase);
     encoder.set_format(format::Pixel::YUV420P);
 
     let mut scaler = ffmpeg_next::software::converter(
@@ -87,98 +66,59 @@ fn main() -> Result<()> {
     )
     .unwrap();
 
-    //let output = format::output(&output_file).unwrap();
-    let mut output = format::output("/tmp/test.mp4").unwrap();
+    let mut output = format::output(&args.output_path).unwrap();
     let mut out_stream = output.add_stream(codec).unwrap();
-
-    dbg!(out_stream.time_base());
 
     // Remember you have to open the encoding context!
     let mut opened = encoder.open().unwrap();
     out_stream.set_parameters(&opened);
 
-    // Having set things up, we try and
     let mut frame_in = frame::Video::empty();
     let mut frame_out = frame::Video::empty();
     let mut packet = packet::Packet::empty();
 
     // write container headers before starting transcode
     output.write_header()?;
-    let out_stream_tbase = output.stream(0).unwrap().time_base();
+    let out_stream_timebase = output.stream(0).unwrap().time_base();
 
     let (tx, rx) = channel();
     ctrlc::set_handler(move || tx.send(()).expect("Could not send signal on channel."))
         .expect("Error setting Ctrl-C handler");
 
-    let mut framecount = 0;
+    // we reset pts to zero for live stream
+    let mut packets_in = device.packets().peekable();
+    let offset = packets_in.peek().and_then(|(_, p)| p.pts()).unwrap();
 
-    loop {
-        if rx.try_recv().is_ok() {
-            break Ok(());
-        }
-        // iterate over packets from device
-        let Some((_, p)) = device.packets().next() else {
-            break Ok(());
+    while let Err(TryRecvError::Empty) = rx.try_recv() {
+        let Some((_, p)) = packets_in.next() else {
+            break;
         };
 
-        // supposedly packet timebase is garbage!
-        //
-        //dbg!(&p.time_base());
-        dbg!(&p.pts(), time::Instant::now());
-        //dbg!(&p.duration());
         decoder.send_packet(&p)?;
-        //dbg!(&p.time_base());
-        //dbg!(&p.pts());
-
         match decoder.receive_frame(&mut frame_in) {
-            Ok(_) => {}
             Err(Error::Other { errno }) if errno == EAGAIN => continue,
-            Err(e) => break Err(e),
+            Err(e) => return Err(e.into()),
+            _ => {}
         };
 
-        dbg!(frame_in.pts());
-        dbg!(frame_in.packet().duration);
-
-        // again this is currently garbage, docs state:
-        // >> In the future, this field may be set on frames output by decoders or filters
-        // >> but its value will be by default ignored on input to encoders or filters.
-        // REF: https://www.ffmpeg.org/doxygen/7.0/structAVFrame.html#a36518d08c8e0ca31785e968add00fd07
-        unsafe {
-            dbg!((*frame_in.as_ptr()).time_base);
-        }
-
+        // Resample due to format change
         scaler.run(&frame_in, &mut frame_out)?;
-        frame_out.set_pts(frame_in.pts());
-        unsafe {
-            //dbg!((*frame_in.as_mut_ptr()).time_base = original_fps.invert().into());
-            //dbg!((*frame_in.as_ptr()).time_base);
-        }
-
-        // IS NONE
-        //dbg!(frame_out.timestamp());
-        // IS RIGHT ?
-        //dbg!(frame_out.pts());
+        frame_out.set_pts(frame_in.pts().map(|ts| ts - offset));
 
         match opened.send_frame(&frame_out) {
-            Err(e) => break Err(e),
+            Err(e) => return Err(e.into()),
             Ok(_) => {
                 // test
                 match opened.receive_packet(&mut packet) {
                     Ok(_) => {}
                     Err(Error::Other { errno }) if errno == EAGAIN => continue,
-                    Err(e) => break Err(e),
+                    Err(e) => return Err(e.into()),
                 };
-
-                //dbg!(&packet.time_base());
-                dbg!(&packet.pts());
-                dbg!(original_fps.invert(), out_stream_tbase);
-                packet.rescale_ts(original_timebase, out_stream_tbase);
-                //dbg!(&packet.time_base());
-                dbg!(&packet.pts());
-                packet.write(&mut output);
+                packet.rescale_ts(in_stream_timebase, out_stream_timebase);
+                packet.write(&mut output)?;
             }
         }
-    }?;
+    }
 
     output.write_trailer()?;
     Ok(())
